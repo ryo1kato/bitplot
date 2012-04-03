@@ -1,0 +1,448 @@
+#!/usr/bin/python
+#
+#   mkbitmap - A simple data visualizing tool
+#
+#                               Ryoichi KATO <ryo1kato@gmail.com>
+#                               Last Change: 2012/04/04 00:40:28.
+#
+
+USAGE = """
+%prog [OPTIONS] DIFF_FILE  OUT_FILE.png
+%prog [OPTIONS] -d  ORIG_FILE  DIFF_FILE  OUT_FILE.png
+%prog [OPTIONS] -s  ORIG_FILE  DIFF_FILE  OUT_FILE.png
+%prog [OPTIONS] -p  PLOT_FILE  OUT_FILE.png
+"""
+# DESCRIPTION
+#
+# EXAMPLE
+#   Diff file (one data per line). You can use 'cmp -l' output as-is.
+#   | 0x1234ABCD 0x00 0xFF
+#   | 0x1234ABCD 0x00 0xFF
+#   | 12345    0  255
+#
+#   Plot file (one data per line)
+#   | # this is comment
+#   | # Hex_addr  color_24bit  after second (sets of) space are comments
+#   | 0x1234ABCD       #0F0  // 0x1234ABCD to green
+#   | 0x12345678ABCDEF #FFF  // 0x12345678ABCDEF to white
+#
+#
+# REQUIREMENT
+#   * Python-2.5 (maybe work with 2.4)
+#   * Python Image Library(PIL)
+#     http://www.pythonware.com/library/pil/handbook/index.htm
+#
+#
+# HISTORY
+# ---- v0.4 ----
+#   * Draw data file (not diff) based on address list of diff file. (--data)
+#   * --data option is changed to --plot
+# ---- v0.3 ----
+#   * Directly load output of 'cmp -l' or 'bindiff.sh' output.
+#     Previous behaviour (process check-bits.sh output) needs '--data' option.
+#   * Online processing for already-sorted input, using Python generator.
+#     (Now it cannot handle unsorted input.)
+#     This significantly speedup/save memory for huge input.
+# ---- v0.2 ----
+#   * Fix address display of folded line (forgotten to multiply with width)
+#   * Human readable size and offset for folds.
+#   * Add support script to version control.
+# ---- v0.1 ----
+#   * Show address for folded lines
+#   * Fix a bug of horizontal lines for each CHUNK_SIZE
+# ---- v0.0 ----
+#   * Initial release
+#
+# ROADMAP
+# ---- v0.5 ----
+#   * Test codes
+#   * Sophisticated progress bar etc.
+#   * Directly compare input files (maybe)
+#
+
+VERSION=(0,4)
+CHUNK_SIZE=256
+FOLD_FONT_MARGIN=2
+
+import optparse
+import sys
+import re
+import string
+from PIL import Image, ImageDraw, ImageFont
+
+##
+## Color definitions for parse_diff_file()
+##
+DIFF_COLOR_ZERO = "#FFF" # Non zero bits to zero
+DIFF_COLOR_UPUP = "#0FF" # Zero to nonzero
+DIFF_COLOR_UP   = "#00F" # Bit raising only
+DIFF_COLOR_DOWN = "#0F0" # Bit falling only
+DIFF_COLOR_BOTH = "#F00" # Other
+
+DATA_COLOR_ZERO = "#FF0"
+DATA_COLOR_EFEF = "#F00"
+
+##
+## Convert byte number to human readable notation.
+## Shamelessly taken from:
+##   http://mail.python.org/pipermail/python-list/2008-August/503423.html
+##
+_abbrevs = [
+    (1<<50L, ' PiB'),
+    (1<<40L, ' TiB'),
+    (1<<30L, ' GiB'),
+    (1<<20L, ' MiB'),
+    (1<<10L, ' kiB'),
+    (1, ' bytes')
+    ]
+
+def human_readable(size, precision=2):
+    """Return a string representing the greek/metric suffix of a size"""
+    if size==1:
+        return '1 byte'
+    for factor, suffix in _abbrevs:
+        if size >= factor:
+            break
+
+    float_string_split = `size/float(factor)`.split('.')
+    integer_part = float_string_split[0]
+    decimal_part = float_string_split[1]
+    if int(decimal_part[0:precision]):
+        float_string = '.'.join([integer_part, decimal_part[0:precision]])
+    else:
+        float_string = integer_part
+    return float_string + suffix
+
+def format_text_address_range(start, end):
+    return "0x%08X - 0x%08X (%s - %s / %s)" %\
+           (  start, end,
+              human_readable(start), human_readable(end),
+              human_readable(end - start + 1)  )
+
+
+##
+## Process 'cmp -l' command output.
+##
+def get_data_color(byte):
+    if byte is 0:
+        return DATA_COLOR_ZERO
+    elif byte is 0xFF:
+        return DATA_COLOR_EFEF
+    return "#0%02X" % byte
+
+def get_diff_color(before, after):
+    if after == 0:
+        return DIFF_COLOR_ZERO
+    elif before == 0:
+        return DIFF_COLOR_UPUP
+    else:
+        down=False
+        up=False
+        if (before^after)&before != 0:
+            down=True
+        if (before^after)&after != 0:
+            up=True
+        if down and up:
+            return DIFF_COLOR_BOTH
+        elif down:
+            return DIFF_COLOR_DOWN
+        elif up:
+            return DIFF_COLOR_UP
+
+def parse_diff_file(diff_file):
+    while True:
+        ## Use readline() instead of readliens(), because input file
+        ## could be very large that doesn't fit into memory.
+        line = diff_file.readline()
+        if not line:
+            break
+        line = re.sub("^\s+", "", line)
+        addr_txt, before_txt, after_txt = re.split('\s+', line, 2)
+        addr   = int(addr_txt, 0)
+        before = int(before_txt, 0)
+        after = int(after_txt, 0)
+
+        yield (addr, get_diff_color(before, after))
+
+def parse_plot_file(diff_file):
+    while True:
+        line = diff_file.readline()
+        if not line:
+            break
+        data = re.split('\s+', line, 2)
+        yield (int(data[0], 0), data[1])
+
+
+#
+#     Original Image            Folded Image
+#    +---------------+         +----------------+
+#    |               |         |                |
+#    |  A            |         |  A             |
+#    | - - - - - - - |- - - - -|===== FOLD =====|
+#    |               |        /|                |
+#    |               |         |    B           | <-- folded_Y of B
+#    |               |      /  |       C        |
+#    |               |         |                |
+#    |               |    /    |                |
+#    |               |         +----------------+
+#    |               |  /           ^
+#    |               |              x_offset of B
+#    |               |/
+#    | - - - - - - - |
+#    |               |
+#    |    B          |<- logical_Y of B
+#    |       C       |
+#    |               |
+#    |               |
+#    +---------------+
+#
+
+class FoldablePlots:
+    def __init__(self, width, bgcolor="#444", foldcolor="#000"):
+        self.width     = width
+        self.bgcolor   = bgcolor
+        self.foldcolor = foldcolor
+
+        self.logical_Y = 0
+        self.folded_Y  = 0
+
+        self.im    = Image.new("RGB", (width, CHUNK_SIZE))
+        self.draw  = ImageDraw.Draw(self.im)
+        self.font  = ImageFont.load_default()
+
+        self.draw.rectangle( [0,0,width,CHUNK_SIZE], fill=bgcolor )
+        self.image_height = CHUNK_SIZE
+
+    def __extend_image(self, Y):
+        if Y >= self.image_height:
+            new_image_height = ((Y / CHUNK_SIZE) + 1) * CHUNK_SIZE
+            self.im = self.im.crop( [0, 0, self.width, new_image_height] )
+            self.im.load()
+            self.draw = ImageDraw.Draw(self.im)
+
+            e = [0, self.image_height, self.width, new_image_height-1]
+            self.draw.rectangle( e, fill=self.bgcolor )
+            self.image_height = new_image_height
+
+    def get_width(self):
+        return self.width
+
+    def point(self, point, color):
+        new_X_offset    =  point[0]
+        new_logical_Y   =  point[1]
+        logical_Y_diff  =  new_logical_Y - self.logical_Y
+
+        if new_logical_Y < self.logical_Y:
+            raise ValueError("Unsorted input value: %d < %d" % ( new_logical_Y, self.logical_Y ) )
+
+        new_folded_Y = self.folded_Y + logical_Y_diff
+
+        self.__extend_image(new_folded_Y)
+
+        self.draw.point( (new_X_offset, new_folded_Y), fill=color )
+
+        self.logical_Y = new_logical_Y
+        self.folded_Y  = new_folded_Y
+
+    def fold_by_line(self, start_Y, end_Y):
+        sys.stderr.write("DEBUG: FOLD %10d ~ %10d\n" % (start_Y, end_Y))
+        if start_Y <= self.logical_Y:
+            raise ValueError("Can't fold from %d when last value is %d" %\
+                             (start_Y, self.logical_Y) )
+        if start_Y >= end_Y:
+            raise ValueError("Invalid (reversed) fold range")
+
+        start_addr = start_Y * self.width
+        end_addr   = (end_Y * self.width) + self.width - 1
+
+        ## Calculate fold band
+        fold_start = self.folded_Y + (start_Y - self.logical_Y)
+        fold_text  = format_text_address_range(start_addr, end_addr)
+        xxx, fold_font_height = self.font.getsize(fold_text)
+        fold_lines = fold_font_height + FOLD_FONT_MARGIN * 2
+        self.__extend_image( fold_start + fold_lines )
+
+        ## Draw fold-band and a text in it.
+        rect = [0, fold_start, self.width, fold_start+fold_lines-1]
+        self.draw.rectangle(rect, fill=self.foldcolor)
+        xy   = (FOLD_FONT_MARGIN, fold_start+FOLD_FONT_MARGIN)
+        self.draw.text(xy, fold_text)
+
+        ## Set pointer to the next line of fold-band
+        self.logical_Y = end_Y + 1
+        self.folded_Y  = fold_start + fold_lines
+
+        return self.logical_Y
+
+    def fold_by_addr(self, start_addr, end_addr):
+        raise NotImplementedError
+
+    def get_image(self):
+        ##
+        ## Because image size glows as unit of CHUNK_SIZE...
+        ##
+        return self.im.crop( [0, 0, self.width, self.folded_Y+1] )
+
+
+def draw_partial_data(foldable_plot, datafd, start_addr, end_addr):
+    width = foldable_plot.get_width()
+    addr = start_addr
+    datafd.seek( addr )
+    #print("draw_partial_data: 0x%X - 0x%X" % (start_addr, end_addr))
+    while addr <= end_addr:
+        one_line = datafd.read(width)
+        X = 0
+        Y = addr / width
+        for d in one_line:
+            foldable_plot.point( (X, Y), get_data_color( ord(d) ) )
+            X = X + 1
+
+        addr = addr + width
+
+def draw_data(datalist, width, fold_unit, align, origfd=None):
+    plot = FoldablePlots(width)
+    logical_Y = 0
+    previous_fold_end_addr = -1
+
+    for data in datalist:
+        new_logical_Y   =  data[0] / width
+        new_X_offset    =  data[0] % width
+
+        if new_logical_Y < logical_Y:
+            raise ValueError("Unsorted input address value: %d", data[0])
+
+        ## Do we need another (set of) folds before new data?
+        ## Notice that we have to fold with alignment.
+        fold_logical_start  =  (logical_Y / align + 1) * align
+        fold_logical_end    =  (new_logical_Y / align) * align - 1
+        if 0 < fold_logical_end - fold_logical_start:
+            fold_start_addr = fold_logical_start * width
+            fold_end_addr   = (fold_logical_end + 1) * width - 1
+
+            if origfd:
+                draw_partial_data(plot, origfd,
+                                  previous_fold_end_addr + 1,
+                                  fold_start_addr - 1 )
+
+            plot.fold_by_line(fold_logical_start, fold_logical_end)
+            previous_fold_end_addr = fold_end_addr
+
+        if not origfd:
+            plot.point( (new_X_offset, new_logical_Y), data[1] )
+
+        logical_Y = new_logical_Y
+
+
+    if origfd:
+        last_entry = (logical_Y+1) * width - 1
+        draw_partial_data(plot, origfd,
+                          previous_fold_end_addr + 1,
+                          last_entry)
+
+    return plot.get_image()
+
+
+
+
+def DIE(msg):
+    sys.stderr.write("%s: ERROR: %s\n" % (sys.argv[0], msg))
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    ##
+    ## Option Parser
+    ##
+    parser = optparse.OptionParser(
+        usage=USAGE,
+        version=("%%prog %d.%d" % VERSION) )
+
+    #Not implemented yet
+    #parser.add_option("-o", "--offset",
+    #    dest="offset", type=int, default=0,
+    #    help="Translate data address as offsetted OFFSET bytes")
+
+    #parser.add_option("-b", "--bgcolor",
+    #    dest="bgcolor", type=int, default=0x000000,
+    #    help="24bit int background color(default: 0x000000)")
+
+    parser.add_option("-w", "--width",
+        dest="width", type=int, default=1024,
+        help="How many pixels per line [1024]")
+
+    parser.add_option("-f", "--fold",
+        dest="fold", type=int, default=1024,
+        help="Fold more than FOLD[1024] lines of repeating data")
+
+    parser.add_option("-d", "--data",
+        action="store_true",
+        help="Plot file contents based on address list of data. " + \
+             "Usefull to check original data against diff.")
+
+    #parser.add_option("-s", "--sidebyside",
+    #    action="store_true",
+    #    help="Plot diff and original data side-by-side." + \
+    #         "Usefull to compare original and diff line-by-line.")
+
+    parser.add_option("-p", "--plot",
+        action="store_true",
+        help="Read plot data(address/color pair), rather than 'cmp -l' output.")
+
+    #parser.add_option("-F", "--foldcolor",
+    #    dest="foldcolor", type=int, default=0x000000,
+    #    help="Fold more than FOLD(default 1024) lines of repeating data into one line")
+
+    parser.add_option("-a", "--align",
+        dest="align", type=int, default=16,
+        help="Align start/end of folding to mutiple of ALIGN[16] lines")
+
+
+    (opt, args) = parser.parse_args(sys.argv)
+
+
+    if opt.data:
+        if len(args) < 3:
+            DIE("too few arguments")
+        orig_file   = args[1]
+        diff_file   = args[2]
+        output_file = args[3]
+    else:
+        if len(args) < 2:
+            DIE("too few arguments")
+        diff_file   = args[1]
+        output_file = args[2]
+
+    ##
+    ## Open input data file and get the iterator
+    ##
+    if diff_file == "-":
+        datafd = sys.stdin
+    else:
+        datafd = open(diff_file, 'r')
+
+    if opt.plot:
+        datalist = parse_plot_file(datafd)
+    else:
+        datalist = parse_diff_file(datafd)
+
+    ##
+    ## Clude check if output_file is writable, because users may not want
+    ## "cannot write to file" error after wait loooooong drawing operation.
+    ## Just open and close immediately.
+    ##
+    outfd = open(output_file, 'w')
+    outfd.close()
+
+    ##
+    ## Write out to image file
+    ##
+    #sys.stdout.write("Drawing ... ")
+    if opt.data:
+        origfd = open(orig_file, 'r')
+        im = draw_data( datalist, opt.width, opt.fold, opt.align, origfd )
+        origfd.close()
+    else:
+        im = draw_data( datalist, opt.width, opt.fold, opt.align )
+
+    im.save(output_file)
+    #sys.stdout.write("done\n")
