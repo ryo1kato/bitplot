@@ -1,15 +1,14 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 #
 #   mkbitmap - A simple data visualizing tool
 #
 #                               Ryoichi KATO <ryo1kato@gmail.com>
-#                               Last Change: 2012/04/04 00:40:28.
+#                               Last Change: 2016/01/24 09:55:37.
 #
 
 USAGE = """
 %prog [OPTIONS] DIFF_FILE  OUT_FILE.png
 %prog [OPTIONS] -d  ORIG_FILE  DIFF_FILE  OUT_FILE.png
-%prog [OPTIONS] -s  ORIG_FILE  DIFF_FILE  OUT_FILE.png
 %prog [OPTIONS] -p  PLOT_FILE  OUT_FILE.png
 """
 # DESCRIPTION
@@ -357,15 +356,6 @@ if __name__ == "__main__":
         usage=USAGE,
         version=("%%prog %d.%d" % VERSION) )
 
-    #Not implemented yet
-    #parser.add_option("-o", "--offset",
-    #    dest="offset", type=int, default=0,
-    #    help="Translate data address as offsetted OFFSET bytes")
-
-    #parser.add_option("-b", "--bgcolor",
-    #    dest="bgcolor", type=int, default=0x000000,
-    #    help="24bit int background color(default: 0x000000)")
-
     parser.add_option("-w", "--width",
         dest="width", type=int, default=1024,
         help="How many pixels per line [1024]")
@@ -379,18 +369,9 @@ if __name__ == "__main__":
         help="Plot file contents based on address list of data. " + \
              "Usefull to check original data against diff.")
 
-    #parser.add_option("-s", "--sidebyside",
-    #    action="store_true",
-    #    help="Plot diff and original data side-by-side." + \
-    #         "Usefull to compare original and diff line-by-line.")
-
     parser.add_option("-p", "--plot",
         action="store_true",
         help="Read plot data(address/color pair), rather than 'cmp -l' output.")
-
-    #parser.add_option("-F", "--foldcolor",
-    #    dest="foldcolor", type=int, default=0x000000,
-    #    help="Fold more than FOLD(default 1024) lines of repeating data into one line")
 
     parser.add_option("-a", "--align",
         dest="align", type=int, default=16,
